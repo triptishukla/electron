@@ -1286,6 +1286,24 @@ describe('BrowserWindow module', () => {
         })
         w.loadFile(path.join(fixtures, 'api', 'preload.html'))
       })
+      it('has synchronous access to all eventual window APIs', (done) => {
+        const preload = path.join(fixtures, 'module', 'access-blink-apis.js')
+        ipcMain.once('answer', (event, test) => {
+          expect(test).to.be.ok('object')
+          expect(test.atPreload).to.be.a('array')
+          expect(test.atLoad).to.be.a('array')
+          expect(test.atPreload).to.deep.equal(test.atLoad, 'should have access to the same window APIs')
+          done()
+        })
+        w.destroy()
+        w = new BrowserWindow({
+          show: false,
+          webPreferences: {
+            preload: preload
+          }
+        })
+        w.loadFile(path.join(fixtures, 'api', 'preload.html'))
+      })
     })
 
     describe('session preload scripts', function () {
