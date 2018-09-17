@@ -35,6 +35,9 @@ env-arm64: &env-arm64
   GN_EXTRA_ARGS: 'target_cpu = "arm64" fatal_linker_warnings = false enable_linux_installer = false'
   MKSNAPSHOT_TOOLCHAIN: //build/toolchain/linux:clang_arm64
 
+env-mas: &env-mas
+  GN_EXTRA_ARGS: 'is_mas_build = true'
+
 # Individual (shared) steps.
 step-maybe-notify-slack-failure: &step-maybe-notify-slack-failure
   run:
@@ -118,6 +121,7 @@ step-persist-data-for-tests: &step-persist-data-for-tests
       # Build artifacts
       - src/out/Default/dist.zip
       - src/out/Default/gen/node_headers
+      - src/out/ffmpeg/libffmpeg.dylib
       - src/out/ffmpeg/libffmpeg.so
 
 step-electron-dist-unzip: &step-electron-dist-unzip
@@ -216,12 +220,21 @@ steps-checkout: &steps-checkout
         command: |
           git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
     - <<: *step-add-depot-tools-to-path
+
+    # FIXME: Should be run only on MacOS.
+    - run:
+        name: Install gnu-tar
+        command: |
+          brew update
+          brew install gnu-tar
+          echo 'export PATH="/usr/local/opt/gnu-tar/libexec/gnubin:$PATH"' >> $BASH_ENV
+
     - restore_cache:
         paths:
           - ~/.gclient-cache
         keys:
-          - v1-gclient-cache-{{ arch }}-{{ checksum "src/electron/DEPS" }}
-          - v1-gclient-cache-{{ arch }}-
+          - v2-gclient-cache-{{ arch }}-{{ checksum "src/electron/DEPS" }}
+#          - v2-gclient-cache-{{ arch }}-
     - run:
         name: Gclient sync
         command: |
@@ -240,7 +253,7 @@ steps-checkout: &steps-checkout
     - save_cache:
         paths:
           - ~/.gclient-cache
-        key: v1-gclient-cache-{{ arch }}-{{ checksum "src/electron/DEPS" }}
+        key: v2-gclient-cache-{{ arch }}-{{ checksum "src/electron/DEPS" }}
     - run:
         name: Remove some unused data to avoid storing it in the workspace
         command: |
@@ -339,78 +352,43 @@ steps-tests: &steps-tests
     - <<: *step-electron-tests-run
     - <<: *step-electron-tests-store-results
 
-# TODO(alexeykuzmin): Use shared build steps defined above for Mac builds.
-mac-build-steps: &mac-build-steps
+# TODO: It looks almost exactly like the generic "steps-testing-build".
+steps-mac-build: &steps-mac-build
   steps:
-    - run:
-        name: Setup depot tools
-        command: |
-          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          echo 'export PATH="$PATH:'"$PWD"'/depot_tools"' >> $BASH_ENV
-          echo 'export GIT_CACHE_PATH="$HOME/.gclient-cache"' >> $BASH_ENV
-    - run:
-        name: Install Node.js 10 on MacOS
-        command: |
-          echo 'Installing Node.js 10 for MacOS'
-          brew update
-          brew install node@10
-          brew install gnu-tar
-          echo 'export PATH="/usr/local/opt/gnu-tar/libexec/gnubin:$PATH"' >> $BASH_ENV
-    - checkout:
-        path: src/electron
-    - run:
-        name: Gclient sync
-        command: |
-          gclient config \
-            --name "src/electron" \
-            --unmanaged \
-            $GCLIENT_EXTRA_ARGS \
-            "$CIRCLE_REPOSITORY_URL"
-          gclient sync --with_branch_heads --with_tags
-    - run:
-        name: GN gen
-        command: |
-          cd src
-          SCCACHE_PATH="$PWD/electron/external_binaries/sccache"
-          echo 'export SCCACHE_WRAPPER="'"$SCCACHE_PATH"'"' >> $BASH_ENV
-          echo 'export CHROMIUM_BUILDTOOLS_PATH="'"$PWD"'/buildtools"' >> $BASH_ENV
-          source $BASH_ENV
-          gn gen out/Default --args='import("'$GN_CONFIG'") cc_wrapper="'"$SCCACHE_PATH"'"'" $GN_EXTRA_ARGS"
-    - run:
-        name: Ninja build
-        command: |
-          cd src
-          ninja -C out/Default electron:electron_app
-    - run:
-        name: Build dist.zip
-        command: |
-          cd src
-          ninja -C out/Default electron:electron_dist_zip
-    - run:
-        name: Check sccache stats after build
-        command: $SCCACHE_WRAPPER -s
-    - run:
-        name: Test
-        environment:
-          MOCHA_REPORTER: mocha-multi-reporters
-          MOCHA_FILE: junit/test-results.xml
-          MOCHA_MULTI_REPORTERS: mocha-junit-reporter, tap
-          ELECTRON_DISABLE_SECURITY_WARNINGS: 1
-        command: |
-          if [ "$RUN_TESTS" != "false" ]; then
-            cd src
-            ninja -C out/Default third_party/electron_node:headers
-            export ELECTRON_OUT_DIR=Default
-            (cd electron && npm run test -- --ci --enable-logging)
-          fi
-    - <<: *step-maybe-notify-slack-failure
-    - <<: *step-maybe-notify-slack-success
-    - store_test_results:
-        path: src/junit
-    - store_artifacts:
-        path: src/junit
-    - store_artifacts:
-        path: src/out/Default/dist.zip
+    - attach_workspace:
+        at: .
+    - <<: *step-add-depot-tools-to-path
+    - <<: *step-setup-env-for-build
+
+# FIXME: Do we need these for the build or the tests?
+#    - run:
+#        name: Install Node.js 10 on MacOS
+#        command: |
+#          echo 'Installing Node.js 10 for MacOS'
+#          brew update
+#          brew install node@10
+
+    # Electron app
+    - <<: *step-electron-gn-gen
+    - <<: *step-electron-build
+    - <<: *step-electron-dist-build
+    - <<: *step-electron-dist-store
+
+    # ffmpeg
+    - <<: *step-ffmpeg-gn-gen
+    - <<: *step-ffmpeg-build
+    - <<: *step-ffmpeg-store
+
+    # Node.js headers for tests
+    - <<: *step-nodejs-headers-build
+
+    - <<: *step-show-sccache-stats
+
+    # TODO: extract the following into a separate job. Or reuse "steps-tests".
+    - <<: *step-verify-ffmpeg
+
+    - <<: *step-electron-tests-run
+    - <<: *step-electron-tests-store-results
 
 # List of all jobs.
 version: 2
@@ -430,6 +408,10 @@ jobs:
     <<: *machine-linux
     environment:
       <<: *env-arm64
+    <<: *steps-checkout
+
+  mac-checkout:
+    <<: *machine-mac
     <<: *steps-checkout
 
   # Layer 2: Builds.
@@ -516,6 +498,19 @@ jobs:
       BUILD_NATIVE_MKSNAPSHOT: true
     <<: *steps-release-build
 
+  osx-testing:
+    <<: *machine-mac
+    environment:
+      <<: *env-testing-build
+    <<: *steps-mac-build
+
+  mas-testing:
+    <<: *machine-mac
+    environment:
+      <<: *env-mas
+      <<: *env-testing-build
+    <<: *steps-mac-build
+
   # Layer 3: Tests.
   linux-x64-testing-tests:
     <<: *machine-linux
@@ -537,59 +532,57 @@ jobs:
       <<: *env-ia32
     <<: *steps-tests
 
-  # Mac builds.
-  # TODO(alexeykuzmin): Use shared configs for them too.
-  electron-osx-testing:
-    environment:
-      GN_CONFIG: //electron/build/args/testing.gn
-    <<: *machine-mac
-    <<: *mac-build-steps
-
-  electron-mas-testing:
-    environment:
-      GN_CONFIG: //electron/build/args/testing.gn
-      GN_EXTRA_ARGS: 'is_mas_build = true'
-    <<: *machine-mac
-    <<: *mac-build-steps
-
 workflows:
   version: 2
-  build-linux:
-    jobs:
-      - linux-checkout
-      - linux-arm-checkout
-      - linux-arm64-checkout
 
-      - linux-x64-debug:
+# FIXME
+  build-mac:
+    jobs:
+      - mac-checkout
+      - mas-testing:
           requires:
-            - linux-checkout
-      - linux-x64-testing:
+            - mac-checkout
+      - osx-testing:
           requires:
-            - linux-checkout
-      - linux-x64-testing-tests:
-          requires:
-            - linux-x64-testing
-      - linux-ia32-debug:
-          requires:
-            - linux-checkout
-      - linux-ia32-testing:
-          requires:
-            - linux-checkout
-      - linux-ia32-testing-tests:
-          requires:
-            - linux-ia32-testing
-      - linux-arm-debug:
-          requires:
-            - linux-arm-checkout
-      - linux-arm-testing:
-          requires:
-            - linux-arm-checkout
-      - linux-arm64-debug:
-          requires:
-            - linux-arm64-checkout
-      - linux-arm64-testing:
-          requires:
-            - linux-arm64-checkout
+            - mac-checkout
+
+# FIXME
+#  build-linux:
+#    jobs:
+#      - linux-checkout
+#      - linux-arm-checkout
+#      - linux-arm64-checkout
+#
+#      - linux-x64-debug:
+#          requires:
+#            - linux-checkout
+#      - linux-x64-testing:
+#          requires:
+#            - linux-checkout
+#      - linux-x64-testing-tests:
+#          requires:
+#            - linux-x64-testing
+#      - linux-ia32-debug:
+#          requires:
+#            - linux-checkout
+#      - linux-ia32-testing:
+#          requires:
+#            - linux-checkout
+#      - linux-ia32-testing-tests:
+#          requires:
+#            - linux-ia32-testing
+#      - linux-arm-debug:
+#          requires:
+#            - linux-arm-checkout
+#      - linux-arm-testing:
+#          requires:
+#            - linux-arm-checkout
+#      - linux-arm64-debug:
+#          requires:
+#            - linux-arm64-checkout
+#      - linux-arm64-testing:
+#          requires:
+#            - linux-arm64-checkout
 
   build-mac-fork-prs:
     jobs:
